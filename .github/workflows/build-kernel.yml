@@ -45,7 +45,7 @@ on:
         default: ""
         type: string
       susfs_branch:
-        description: "SUSFS branch (blank = config default)"
+        description: "SUSFS branch (blank = auto by kernel version)"
         required: false
         default: ""
         type: string
@@ -118,6 +118,7 @@ jobs:
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
 
       # workflow inputs -> IN_* overrides consumed by scripts/config.sh
       IN_KSU_VARIANT: ${{ inputs.ksu_variant }}
@@ -137,19 +138,28 @@ jobs:
       - name: Resolve configuration
         run: bash scripts/config.sh
 
-      - name: Free up disk space
+      # ---------------------------------------------------------------------
+      # Free disk (fast, replaces jlumbroso/free-disk-space which is slower)
+      # ---------------------------------------------------------------------
+      - name: Free disk (fast)
         if: env.REMOVE_UNUSED_PACKAGES == 'true'
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          tool-cache: true
-          android: false
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
+        run: |
+          set -x
+          # Remove heavy pre-installed toolchains we never use.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
 
+      # ---------------------------------------------------------------------
+      # Swap (only when LTO enabled; saves ~15s otherwise)
+      # ---------------------------------------------------------------------
       - name: Add swap space
+        if: env.ENABLE_LTO == 'true'
         run: |
           sudo fallocate -l 8G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
@@ -157,6 +167,9 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
 
+      # ---------------------------------------------------------------------
+      # Build deps
+      # ---------------------------------------------------------------------
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
@@ -164,19 +177,38 @@ jobs:
             bc bison build-essential ccache cpio curl device-tree-compiler flex \
             git libelf-dev libssl-dev lz4 make python3 rsync unzip zip zstd \
             libncurses-dev
-          mkdir -p "$WORKSPACE"
+          mkdir -p "$WORKSPACE" "$CCACHE_DIR"
+          ccache --version
+          ccache --max-size=5G
+
+      # ---------------------------------------------------------------------
+      # Toolchain cache (AOSP clang ~1.5GB, saves 1-2 min per run)
+      # ---------------------------------------------------------------------
+      - name: Cache toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORKSPACE }}/toolchain
+          key: toolchain-${{ env.TOOLCHAIN }}-${{ env.CLANG_VERSION }}-${{ env.GCC_VERSION }}
 
       - name: Set up toolchain
         run: bash scripts/toolchain.sh
 
+      # ---------------------------------------------------------------------
+      # Kernel source (shallow clone controlled by scripts/source.sh)
+      # ---------------------------------------------------------------------
       - name: Fetch kernel source
         run: bash scripts/source.sh
 
+      # ---------------------------------------------------------------------
+      # KernelSU
+      # ---------------------------------------------------------------------
       - name: Install KernelSU
         if: env.KSU_VARIANT != 'none'
         run: bash scripts/kernelsu.sh
 
-      # -------- BEGIN PATCH STAGE (với debug & fallback) --------
+      # ---------------------------------------------------------------------
+      # Kernel patches (with debug on failure)
+      # ---------------------------------------------------------------------
       - name: Apply kernel patches
         id: patches
         run: bash scripts/patches.sh all
@@ -215,18 +247,45 @@ jobs:
             kernel_workspace/android-kernel/**/*.rej
             kernel_workspace/android-kernel/**/*.orig
           if-no-files-found: ignore
-      # -------- END PATCH STAGE --------
 
-      - name: Set up ccache
+      # ---------------------------------------------------------------------
+      # ccache: restore before build, save even on failure
+      # Pattern: unique key per run + restore-keys prefix -> always restore
+      # latest, always save current.
+      # ---------------------------------------------------------------------
+      - name: Restore ccache
+        id: ccache-restore
         if: env.ENABLE_CCACHE == 'true'
-        uses: hendrikmuhs/ccache-action@v1.2
+        uses: actions/cache/restore@v4
         with:
-          key: kernel-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-${{ env.KERNEL_VERSION }}
-          max-size: 2G
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-${{ env.KERNEL_VERSION }}-${{ env.SUSFS_BRANCH }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-${{ env.KERNEL_VERSION }}-${{ env.SUSFS_BRANCH }}-
+            ccache-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-${{ env.KERNEL_VERSION }}-
+            ccache-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-
+            ccache-${{ env.DEVICE }}-
 
+      # ---------------------------------------------------------------------
+      # Build
+      # ---------------------------------------------------------------------
       - name: Build kernel
         run: bash scripts/build.sh all
 
+      - name: Save ccache (always)
+        if: always() && env.ENABLE_CCACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-${{ env.KERNEL_VERSION }}-${{ env.SUSFS_BRANCH }}-${{ github.run_id }}
+
+      - name: Print ccache stats
+        if: always() && env.ENABLE_CCACHE == 'true'
+        run: ccache --show-stats || true
+
+      # ---------------------------------------------------------------------
+      # Package
+      # ---------------------------------------------------------------------
       - name: Package artifacts
         run: bash scripts/package.sh all
 
@@ -270,6 +329,9 @@ jobs:
           name: boot${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
           path: kernel_workspace/boot.img
 
+  # =========================================================================
+  # Release job (unchanged)
+  # =========================================================================
   release:
     name: Publish release
     needs: build
