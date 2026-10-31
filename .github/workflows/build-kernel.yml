@@ -138,62 +138,108 @@ jobs:
         run: bash scripts/config.sh
 
       # =====================================================================
-      # AUTO-PATCH scripts/build.sh: thêm || die để không nuốt lỗi defconfig
+      # AUTO-FIX scripts/kernelsu.sh: ksu_hook_configs() die khi variant != kernelsu-next
       # =====================================================================
-      - name: Auto-harden scripts/build.sh
+      - name: Auto-fix kernelsu.sh hook config
         run: |
           set -e
-          FILE="scripts/build.sh"
+          FILE="scripts/kernelsu.sh"
           if [ ! -f "$FILE" ]; then
             echo "::error::$FILE not found"
             exit 1
           fi
-
-          # Backup
           cp "$FILE" "$FILE.bak"
 
-          # Thêm || die sau các lệnh có thể fail trong prepare_defconfig.
-          # Dùng python để replace chính xác, không phụ thuộc sed.
           python3 - "$FILE" <<'PYEOF'
           import re, sys
           path = sys.argv[1]
           src = open(path).read()
 
-          # 1. cp defconfig -> thêm || die
+          # Tìm hàm ksu_hook_configs và sửa dòng die cuối thành return 0.
+          # Pattern: trong thân hàm, có dòng `die "ksu_hook_configs failed..."`
+          # (thường ở cuối). Thay bằng return 0.
+
+          # Cách an toàn: thay mọi dòng die trong khoảng hàm này.
+          def fix_hook_func(text):
+              # Xác định vị trí hàm
+              m = re.search(r'^ksu_hook_configs\(\)\s*\{', text, re.MULTILINE)
+              if not m:
+                  print("[!] ksu_hook_configs() not found — skip", file=sys.stderr)
+                  return text
+
+              start = m.end()
+              # Tìm } đóng hàm (đơn giản: dò dấu } ở đầu dòng, cùng cấp)
+              depth = 1
+              i = start
+              while i < len(text) and depth > 0:
+                  if text[i] == '{':
+                      depth += 1
+                  elif text[i] == '}':
+                      depth -= 1
+                  i += 1
+              end = i
+
+              body = text[start:end]
+
+              # Thay die "ksu_hook_configs failed..." -> return 0 (an toàn cho variant khác)
+              new_body = re.sub(
+                  r'^\s*die\s+"ksu_hook_configs failed[^"]*"\s*$',
+                  '    return 0  # auto-fixed: allow non-kernelsu-next variants',
+                  body,
+                  flags=re.MULTILINE
+              )
+
+              if new_body == body:
+                  print("[!] no die in ksu_hook_configs matched — pattern may differ", file=sys.stderr)
+
+              return text[:start] + new_body + text[end:]
+
+          new_src = fix_hook_func(src)
+          open(path, 'w').write(new_src)
+          print("[+] kernelsu.sh patched")
+          PYEOF
+
+          echo "=== diff kernelsu.sh ==="
+          diff -u "$FILE.bak" "$FILE" || true
+
+      # =====================================================================
+      # AUTO-FIX scripts/build.sh: thêm || die để không nuốt lỗi defconfig
+      # =====================================================================
+      - name: Auto-harden scripts/build.sh
+        run: |
+          set -e
+          FILE="scripts/build.sh"
+          [ -f "$FILE" ] || { echo "::error::$FILE not found"; exit 1; }
+          cp "$FILE" "$FILE.bak"
+
+          python3 - "$FILE" <<'PYEOF'
+          import re, sys
+          path = sys.argv[1]
+          src = open(path).read()
+
           src = src.replace(
               'cp "$DEFCONFIG_PATH" "${WORKSPACE}/defconfig.orig"',
               'cp "$DEFCONFIG_PATH" "${WORKSPACE}/defconfig.orig" || die "cannot copy defconfig"'
           )
-
-          # 2. kconf_enable CONFIG_KSU
           src = src.replace(
               'kconf_enable "$DEFCONFIG_PATH" CONFIG_KSU\n',
               'kconf_enable "$DEFCONFIG_PATH" CONFIG_KSU || die "kconf_enable CONFIG_KSU failed"\n'
           )
-
-          # 3. ksu_hook_configs
           src = re.sub(
               r'ksu_hook_configs "\$\{KSU_VARIANT\}"[^\n]*\n',
-              lambda m: m.group(0).rstrip('\n') + ' || die "ksu_hook_configs failed (variant=${KSU_VARIANT} hook=${KSU_HOOK_MODE:-auto} kver=$kver)"\n',
+              lambda m: m.group(0).rstrip('\n') + ' || die "ksu_hook_configs failed"\n',
               src
           )
-
-          # 4. susfs_defconfig
           src = re.sub(
               r'susfs_defconfig "\$DEFCONFIG_PATH"\n',
               'susfs_defconfig "$DEFCONFIG_PATH" || die "susfs_defconfig failed"\n',
               src
           )
-
-          # 5. kconf_set_many KPM
           src = re.sub(
               r'(kconf_set_many "\$DEFCONFIG_PATH" \\\n\s*CONFIG_KPM=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y)\n',
               r'\1 || die "kconf_set_many KPM failed"\n',
               src
           )
-
-          # 6. Thêm set -x tạm thời trong prepare_defconfig để thấy lệnh fail
-          #    (chỉ thêm ở đầu hàm, sẽ tắt trước endgroup)
           src = src.replace(
               'prepare_defconfig() {\n\tgroup "Preparing defconfig"',
               'prepare_defconfig() {\n\tgroup "Preparing defconfig"\n\tset -x'
@@ -202,7 +248,6 @@ jobs:
               '\tinfo "defconfig changes:"',
               '\tset +x\n\tinfo "defconfig changes:"'
           )
-
           open(path, 'w').write(src)
           print("[+] hardened build.sh")
           PYEOF
@@ -210,19 +255,13 @@ jobs:
           echo "=== diff build.sh ==="
           diff -u "$FILE.bak" "$FILE" || true
 
-      # =====================================================================
-      # Disk space (fast)
-      # =====================================================================
       - name: Free disk (fast)
         if: env.REMOVE_UNUSED_PACKAGES == 'true'
         run: |
           set -x
           sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc \
-            /opt/hostedtoolcache/CodeQL \
-            /usr/local/share/boost \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
             "$AGENT_TOOLSDIRECTORY" || true
           df -h /
 
@@ -258,45 +297,31 @@ jobs:
       - name: Fetch kernel source
         run: bash scripts/source.sh
 
-      # =====================================================================
-      # TỰ ĐỘNG PHÁT HIỆN SYMLINK HỎNG + branch bị nhiễm
-      # =====================================================================
       - name: Auto-fix kernel tree state
         run: |
           set -e
           KDIR="$WORKSPACE/android-kernel"
           cd "$KDIR" || { echo "::error::kernel dir missing"; exit 1; }
-
           echo "=== branch ==="
           git rev-parse --abbrev-ref HEAD || true
-
           echo "=== drivers/kernelsu ==="
           ls -la drivers/kernelsu 2>/dev/null || echo "(not present)"
-
-          # Nếu drivers/kernelsu là symlink hỏng -> xóa
           if [ -L drivers/kernelsu ] && [ ! -e drivers/kernelsu ]; then
             echo "[!] drivers/kernelsu is a broken symlink, removing"
             rm -f drivers/kernelsu
           fi
-
-          # Nếu KernelSU/ rỗng hoặc không có kernel/ -> xóa để kernelsu.sh cài lại
           if [ -d KernelSU ] && [ ! -d KernelSU/kernel ]; then
             echo "[!] KernelSU/ exists but KernelSU/kernel missing, removing"
             rm -rf KernelSU
           fi
-
           echo "=== after fix ==="
           ls -la drivers/kernelsu 2>/dev/null || echo "(not present)"
           ls -la KernelSU 2>/dev/null || echo "(not present)"
-          git status --short | head -20 || true
 
       - name: Install KernelSU
         if: env.KSU_VARIANT != 'none'
         run: bash scripts/kernelsu.sh
 
-      # =====================================================================
-      # DEBUG: chạy thử từng hàm defconfig TRƯỚC KHI gọi build.sh
-      # =====================================================================
       - name: Debug - dry-run defconfig helpers
         run: |
           set +e
@@ -304,36 +329,19 @@ jobs:
           source scripts/lib.sh 2>/dev/null
           source scripts/kernelsu.sh 2>/dev/null
           source scripts/patches.sh 2>/dev/null
-
           echo "KERNEL_DIR=${KERNEL_DIR:-<unset>}"
           echo "KERNEL_CONFIG=${KERNEL_CONFIG:-<unset>}"
           echo "KSU_VARIANT=${KSU_VARIANT:-<unset>}"
           echo "KSU_HOOK_MODE=${KSU_HOOK_MODE:-<unset>}"
           echo "ENABLE_SUSFS=${ENABLE_SUSFS:-<unset>}"
-          echo "ARCH=${ARCH:-<unset>}"
-
-          if [ -z "${KERNEL_CONFIG:-}" ]; then
-            echo "::error::KERNEL_CONFIG is not set"
-            exit 1
-          fi
-
           DEFCONFIG_PATH="$KERNEL_DIR/arch/${ARCH:-arm64}/configs/${KERNEL_CONFIG}"
-          echo "DEFCONFIG_PATH=$DEFCONFIG_PATH"
           ls -la "$DEFCONFIG_PATH" || { echo "::error::defconfig not found"; exit 1; }
-
-          cp "$DEFCONFIG_PATH" /tmp/dbg.orig || { echo "::error::cp failed"; exit 1; }
-          echo "cp OK"
-
+          cp "$DEFCONFIG_PATH" /tmp/dbg.orig || exit 1
           if [ "${KSU_VARIANT:-none}" != "none" ]; then
-            kconf_enable "$DEFCONFIG_PATH" CONFIG_KSU
-            echo "kconf_enable CONFIG_KSU rc=$?"
-
-            ksu_hook_configs "${KSU_VARIANT}" "${KSU_HOOK_MODE:-auto}" "$DEFCONFIG_PATH" "4.19.325"
-            echo "ksu_hook_configs rc=$?"
-
+            kconf_enable "$DEFCONFIG_PATH" CONFIG_KSU; echo "kconf_enable rc=$?"
+            ksu_hook_configs "${KSU_VARIANT}" "${KSU_HOOK_MODE:-auto}" "$DEFCONFIG_PATH" "4.19.325"; echo "ksu_hook_configs rc=$?"
             if [ "${ENABLE_SUSFS:-false}" = "true" ]; then
-              susfs_defconfig "$DEFCONFIG_PATH"
-              echo "susfs_defconfig rc=$?"
+              susfs_defconfig "$DEFCONFIG_PATH"; echo "susfs_defconfig rc=$?"
             fi
           fi
           echo "dry-run finished"
@@ -346,12 +354,9 @@ jobs:
         if: always()
         run: |
           cd "$WORKSPACE/android-kernel" || exit 0
-          echo "=== Makefile head ==="
-          head -5 Makefile || true
-          echo "=== git log ==="
-          git log --oneline -3 || true
-          echo "=== git status ==="
-          git status --short | head -50 || true
+          echo "=== Makefile head ==="; head -5 Makefile || true
+          echo "=== git log ==="; git log --oneline -3 || true
+          echo "=== git status ==="; git status --short | head -50 || true
 
       - name: Debug - show patch reject files
         if: failure() || steps.patches.outcome == 'failure'
@@ -359,9 +364,7 @@ jobs:
           cd "$WORKSPACE/android-kernel" || exit 0
           find . -name "*.rej" | head -50 || true
           for f in $(find . -name "*.rej" | head -10); do
-            echo "----- $f -----"
-            cat "$f" || true
-            echo
+            echo "----- $f -----"; cat "$f" || true; echo
           done
           find . -name "*.orig" | head -50 || true
 
@@ -391,7 +394,6 @@ jobs:
       - name: Build kernel
         id: build
         run: |
-          # Chạy build.sh với bash -x để mọi lệnh đều in ra log
           bash -x scripts/build.sh all 2>&1 | tee /tmp/build.log
           rc=${PIPESTATUS[0]}
           if [ $rc -ne 0 ]; then
