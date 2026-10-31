@@ -2,18 +2,12 @@ name: Build Kernel
 
 on:
   workflow_dispatch:
-    # GitHub allows at most 10 workflow_dispatch inputs, so these are the knobs
-    # worth changing per-run. Everything else lives in the config file selected
-    # by `config`, so a fork can keep one profile per device.
     inputs:
       config:
         description: "Config file to build (path, relative to the repo root)"
         required: false
         default: "config.env"
         type: string
-      # "config" on the options below means "use whatever the config file says".
-      # It is the default so that running the form without touching anything
-      # reproduces exactly what your profile describes.
       ksu_variant:
         description: "KernelSU variant"
         required: false
@@ -45,6 +39,16 @@ on:
         default: "config"
         type: choice
         options: [config, "true", "false"]
+      susfs_repo:
+        description: "SUSFS repo URL (blank = config default)"
+        required: false
+        default: ""
+        type: string
+      susfs_branch:
+        description: "SUSFS branch (blank = config default)"
+        required: false
+        default: ""
+        type: string
       path_umount:
         description: "Backport path_umount() (needed on kernels older than 5.9)"
         required: false
@@ -81,13 +85,14 @@ on:
       ksu_ref:         { required: false, default: "",           type: string }
       hook_mode:       { required: false, default: "config",     type: string }
       susfs:           { required: false, default: "config",     type: string }
+      susfs_repo:      { required: false, default: "",           type: string }
+      susfs_branch:    { required: false, default: "",           type: string }
       path_umount:     { required: false, default: "config",     type: string }
       hide_stuff:      { required: false, default: "config",     type: string }
       kpm:             { required: false, default: "config",     type: string }
       extra_defconfig: { required: false, default: "",           type: string }
       publish_release: { required: false, default: false,        type: boolean }
 
-# Only one build per ref at a time; a newer run supersedes an older one.
 concurrency:
   group: build-kernel-${{ github.ref }}-${{ inputs.config }}
   cancel-in-progress: true
@@ -119,6 +124,8 @@ jobs:
       IN_KSU_REF: ${{ inputs.ksu_ref }}
       IN_KSU_HOOK_MODE: ${{ inputs.hook_mode }}
       IN_ENABLE_SUSFS: ${{ inputs.susfs }}
+      IN_SUSFS_REPO: ${{ inputs.susfs_repo }}
+      IN_SUSFS_BRANCH: ${{ inputs.susfs_branch }}
       IN_ENABLE_PATH_UMOUNT: ${{ inputs.path_umount }}
       IN_ENABLE_HIDE_STUFF: ${{ inputs.hide_stuff }}
       IN_ENABLE_KPM: ${{ inputs.kpm }}
@@ -144,8 +151,6 @@ jobs:
 
       - name: Add swap space
         run: |
-          # LTO links are memory-hungry and the runner has 16GB; a swap file is
-          # cheaper and more predictable than an unpinned third-party action.
           sudo fallocate -l 8G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
@@ -155,10 +160,6 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
-          # Kept deliberately lean. The historical list here was copied from the
-          # full AOSP platform build docs and pulled in ~40 packages a kernel
-          # build never touches, several of which no longer exist on current
-          # Ubuntu (python2, lib32ncurses5-dev, ...).
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ccache cpio curl device-tree-compiler flex \
             git libelf-dev libssl-dev lz4 make python3 rsync unzip zip zstd \
@@ -175,8 +176,46 @@ jobs:
         if: env.KSU_VARIANT != 'none'
         run: bash scripts/kernelsu.sh
 
+      # -------- BEGIN PATCH STAGE (với debug & fallback) --------
       - name: Apply kernel patches
+        id: patches
         run: bash scripts/patches.sh all
+
+      - name: Debug - kernel version and git status
+        if: always()
+        run: |
+          cd "$WORKSPACE/android-kernel" || exit 0
+          echo "=== Makefile head ==="
+          head -5 Makefile || true
+          echo "=== git log ==="
+          git log --oneline -3 || true
+          echo "=== git status ==="
+          git status --short | head -50 || true
+
+      - name: Debug - show patch reject files
+        if: failure() || steps.patches.outcome == 'failure'
+        run: |
+          cd "$WORKSPACE/android-kernel" || exit 0
+          echo "=== .rej files ==="
+          find . -name "*.rej" | head -50 || true
+          for f in $(find . -name "*.rej" | head -10); do
+            echo "----- $f -----"
+            cat "$f" || true
+            echo
+          done
+          echo "=== .orig files ==="
+          find . -name "*.orig" | head -50 || true
+
+      - name: Upload patch rejects
+        if: failure() || steps.patches.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-rejects-${{ env.DEVICE || 'unknown' }}
+          path: |
+            kernel_workspace/android-kernel/**/*.rej
+            kernel_workspace/android-kernel/**/*.orig
+          if-no-files-found: ignore
+      # -------- END PATCH STAGE --------
 
       - name: Set up ccache
         if: env.ENABLE_CCACHE == 'true'
@@ -231,8 +270,6 @@ jobs:
           name: boot${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
           path: kernel_workspace/boot.img
 
-  # Publishing is a separate job so the build itself runs with a read-only
-  # token; only this job gets contents:write, and only when asked for.
   release:
     name: Publish release
     needs: build
