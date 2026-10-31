@@ -120,7 +120,6 @@ jobs:
       CCACHE_HARDLINK: "true"
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
-      # workflow inputs -> IN_* overrides consumed by scripts/config.sh
       IN_KSU_VARIANT: ${{ inputs.ksu_variant }}
       IN_KSU_REF: ${{ inputs.ksu_ref }}
       IN_KSU_HOOK_MODE: ${{ inputs.hook_mode }}
@@ -138,14 +137,86 @@ jobs:
       - name: Resolve configuration
         run: bash scripts/config.sh
 
-      # ---------------------------------------------------------------------
-      # Free disk (fast, replaces jlumbroso/free-disk-space which is slower)
-      # ---------------------------------------------------------------------
+      # =====================================================================
+      # AUTO-PATCH scripts/build.sh: thêm || die để không nuốt lỗi defconfig
+      # =====================================================================
+      - name: Auto-harden scripts/build.sh
+        run: |
+          set -e
+          FILE="scripts/build.sh"
+          if [ ! -f "$FILE" ]; then
+            echo "::error::$FILE not found"
+            exit 1
+          fi
+
+          # Backup
+          cp "$FILE" "$FILE.bak"
+
+          # Thêm || die sau các lệnh có thể fail trong prepare_defconfig.
+          # Dùng python để replace chính xác, không phụ thuộc sed.
+          python3 - "$FILE" <<'PYEOF'
+          import re, sys
+          path = sys.argv[1]
+          src = open(path).read()
+
+          # 1. cp defconfig -> thêm || die
+          src = src.replace(
+              'cp "$DEFCONFIG_PATH" "${WORKSPACE}/defconfig.orig"',
+              'cp "$DEFCONFIG_PATH" "${WORKSPACE}/defconfig.orig" || die "cannot copy defconfig"'
+          )
+
+          # 2. kconf_enable CONFIG_KSU
+          src = src.replace(
+              'kconf_enable "$DEFCONFIG_PATH" CONFIG_KSU\n',
+              'kconf_enable "$DEFCONFIG_PATH" CONFIG_KSU || die "kconf_enable CONFIG_KSU failed"\n'
+          )
+
+          # 3. ksu_hook_configs
+          src = re.sub(
+              r'ksu_hook_configs "\$\{KSU_VARIANT\}"[^\n]*\n',
+              lambda m: m.group(0).rstrip('\n') + ' || die "ksu_hook_configs failed (variant=${KSU_VARIANT} hook=${KSU_HOOK_MODE:-auto} kver=$kver)"\n',
+              src
+          )
+
+          # 4. susfs_defconfig
+          src = re.sub(
+              r'susfs_defconfig "\$DEFCONFIG_PATH"\n',
+              'susfs_defconfig "$DEFCONFIG_PATH" || die "susfs_defconfig failed"\n',
+              src
+          )
+
+          # 5. kconf_set_many KPM
+          src = re.sub(
+              r'(kconf_set_many "\$DEFCONFIG_PATH" \\\n\s*CONFIG_KPM=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y)\n',
+              r'\1 || die "kconf_set_many KPM failed"\n',
+              src
+          )
+
+          # 6. Thêm set -x tạm thời trong prepare_defconfig để thấy lệnh fail
+          #    (chỉ thêm ở đầu hàm, sẽ tắt trước endgroup)
+          src = src.replace(
+              'prepare_defconfig() {\n\tgroup "Preparing defconfig"',
+              'prepare_defconfig() {\n\tgroup "Preparing defconfig"\n\tset -x'
+          )
+          src = src.replace(
+              '\tinfo "defconfig changes:"',
+              '\tset +x\n\tinfo "defconfig changes:"'
+          )
+
+          open(path, 'w').write(src)
+          print("[+] hardened build.sh")
+          PYEOF
+
+          echo "=== diff build.sh ==="
+          diff -u "$FILE.bak" "$FILE" || true
+
+      # =====================================================================
+      # Disk space (fast)
+      # =====================================================================
       - name: Free disk (fast)
         if: env.REMOVE_UNUSED_PACKAGES == 'true'
         run: |
           set -x
-          # Remove heavy pre-installed toolchains we never use.
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -155,9 +226,6 @@ jobs:
             "$AGENT_TOOLSDIRECTORY" || true
           df -h /
 
-      # ---------------------------------------------------------------------
-      # Swap (only when LTO enabled; saves ~15s otherwise)
-      # ---------------------------------------------------------------------
       - name: Add swap space
         if: env.ENABLE_LTO == 'true'
         run: |
@@ -167,9 +235,6 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
 
-      # ---------------------------------------------------------------------
-      # Build deps
-      # ---------------------------------------------------------------------
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
@@ -181,9 +246,6 @@ jobs:
           ccache --version
           ccache --max-size=5G
 
-      # ---------------------------------------------------------------------
-      # Toolchain cache (AOSP clang ~1.5GB, saves 1-2 min per run)
-      # ---------------------------------------------------------------------
       - name: Cache toolchain
         uses: actions/cache@v4
         with:
@@ -193,22 +255,89 @@ jobs:
       - name: Set up toolchain
         run: bash scripts/toolchain.sh
 
-      # ---------------------------------------------------------------------
-      # Kernel source (shallow clone controlled by scripts/source.sh)
-      # ---------------------------------------------------------------------
       - name: Fetch kernel source
         run: bash scripts/source.sh
 
-      # ---------------------------------------------------------------------
-      # KernelSU
-      # ---------------------------------------------------------------------
+      # =====================================================================
+      # TỰ ĐỘNG PHÁT HIỆN SYMLINK HỎNG + branch bị nhiễm
+      # =====================================================================
+      - name: Auto-fix kernel tree state
+        run: |
+          set -e
+          KDIR="$WORKSPACE/android-kernel"
+          cd "$KDIR" || { echo "::error::kernel dir missing"; exit 1; }
+
+          echo "=== branch ==="
+          git rev-parse --abbrev-ref HEAD || true
+
+          echo "=== drivers/kernelsu ==="
+          ls -la drivers/kernelsu 2>/dev/null || echo "(not present)"
+
+          # Nếu drivers/kernelsu là symlink hỏng -> xóa
+          if [ -L drivers/kernelsu ] && [ ! -e drivers/kernelsu ]; then
+            echo "[!] drivers/kernelsu is a broken symlink, removing"
+            rm -f drivers/kernelsu
+          fi
+
+          # Nếu KernelSU/ rỗng hoặc không có kernel/ -> xóa để kernelsu.sh cài lại
+          if [ -d KernelSU ] && [ ! -d KernelSU/kernel ]; then
+            echo "[!] KernelSU/ exists but KernelSU/kernel missing, removing"
+            rm -rf KernelSU
+          fi
+
+          echo "=== after fix ==="
+          ls -la drivers/kernelsu 2>/dev/null || echo "(not present)"
+          ls -la KernelSU 2>/dev/null || echo "(not present)"
+          git status --short | head -20 || true
+
       - name: Install KernelSU
         if: env.KSU_VARIANT != 'none'
         run: bash scripts/kernelsu.sh
 
-      # ---------------------------------------------------------------------
-      # Kernel patches (with debug on failure)
-      # ---------------------------------------------------------------------
+      # =====================================================================
+      # DEBUG: chạy thử từng hàm defconfig TRƯỚC KHI gọi build.sh
+      # =====================================================================
+      - name: Debug - dry-run defconfig helpers
+        run: |
+          set +e
+          cd "$WORKSPACE/android-kernel" || exit 0
+          source scripts/lib.sh 2>/dev/null
+          source scripts/kernelsu.sh 2>/dev/null
+          source scripts/patches.sh 2>/dev/null
+
+          echo "KERNEL_DIR=${KERNEL_DIR:-<unset>}"
+          echo "KERNEL_CONFIG=${KERNEL_CONFIG:-<unset>}"
+          echo "KSU_VARIANT=${KSU_VARIANT:-<unset>}"
+          echo "KSU_HOOK_MODE=${KSU_HOOK_MODE:-<unset>}"
+          echo "ENABLE_SUSFS=${ENABLE_SUSFS:-<unset>}"
+          echo "ARCH=${ARCH:-<unset>}"
+
+          if [ -z "${KERNEL_CONFIG:-}" ]; then
+            echo "::error::KERNEL_CONFIG is not set"
+            exit 1
+          fi
+
+          DEFCONFIG_PATH="$KERNEL_DIR/arch/${ARCH:-arm64}/configs/${KERNEL_CONFIG}"
+          echo "DEFCONFIG_PATH=$DEFCONFIG_PATH"
+          ls -la "$DEFCONFIG_PATH" || { echo "::error::defconfig not found"; exit 1; }
+
+          cp "$DEFCONFIG_PATH" /tmp/dbg.orig || { echo "::error::cp failed"; exit 1; }
+          echo "cp OK"
+
+          if [ "${KSU_VARIANT:-none}" != "none" ]; then
+            kconf_enable "$DEFCONFIG_PATH" CONFIG_KSU
+            echo "kconf_enable CONFIG_KSU rc=$?"
+
+            ksu_hook_configs "${KSU_VARIANT}" "${KSU_HOOK_MODE:-auto}" "$DEFCONFIG_PATH" "4.19.325"
+            echo "ksu_hook_configs rc=$?"
+
+            if [ "${ENABLE_SUSFS:-false}" = "true" ]; then
+              susfs_defconfig "$DEFCONFIG_PATH"
+              echo "susfs_defconfig rc=$?"
+            fi
+          fi
+          echo "dry-run finished"
+
       - name: Apply kernel patches
         id: patches
         run: bash scripts/patches.sh all
@@ -228,14 +357,12 @@ jobs:
         if: failure() || steps.patches.outcome == 'failure'
         run: |
           cd "$WORKSPACE/android-kernel" || exit 0
-          echo "=== .rej files ==="
           find . -name "*.rej" | head -50 || true
           for f in $(find . -name "*.rej" | head -10); do
             echo "----- $f -----"
             cat "$f" || true
             echo
           done
-          echo "=== .orig files ==="
           find . -name "*.orig" | head -50 || true
 
       - name: Upload patch rejects
@@ -248,11 +375,6 @@ jobs:
             kernel_workspace/android-kernel/**/*.orig
           if-no-files-found: ignore
 
-      # ---------------------------------------------------------------------
-      # ccache: restore before build, save even on failure
-      # Pattern: unique key per run + restore-keys prefix -> always restore
-      # latest, always save current.
-      # ---------------------------------------------------------------------
       - name: Restore ccache
         id: ccache-restore
         if: env.ENABLE_CCACHE == 'true'
@@ -266,11 +388,18 @@ jobs:
             ccache-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-
             ccache-${{ env.DEVICE }}-
 
-      # ---------------------------------------------------------------------
-      # Build
-      # ---------------------------------------------------------------------
       - name: Build kernel
-        run: bash scripts/build.sh all
+        id: build
+        run: |
+          # Chạy build.sh với bash -x để mọi lệnh đều in ra log
+          bash -x scripts/build.sh all 2>&1 | tee /tmp/build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            echo "::error::build.sh failed with exit $rc"
+            echo "--- last 80 lines ---"
+            tail -80 /tmp/build.log
+            exit $rc
+          fi
 
       - name: Save ccache (always)
         if: always() && env.ENABLE_CCACHE == 'true'
@@ -283,9 +412,14 @@ jobs:
         if: always() && env.ENABLE_CCACHE == 'true'
         run: ccache --show-stats || true
 
-      # ---------------------------------------------------------------------
-      # Package
-      # ---------------------------------------------------------------------
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.DEVICE || 'unknown' }}-${{ github.run_id }}
+          path: /tmp/build.log
+          if-no-files-found: ignore
+
       - name: Package artifacts
         run: bash scripts/package.sh all
 
@@ -329,9 +463,6 @@ jobs:
           name: boot${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
           path: kernel_workspace/boot.img
 
-  # =========================================================================
-  # Release job (unchanged)
-  # =========================================================================
   release:
     name: Publish release
     needs: build
