@@ -62,7 +62,7 @@ jobs:
             fi
           done <<'URLS'
           https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh
-          https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh
+          https://raw.githubusercontent.com/wshamroukh/KernelSU-Next-SUSFS-kernelv4.19/refs/heads/ksun-v3.4.0-legacy-susfs-v2.3.0/kernel/setup.sh
           https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh
           https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh
           https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh
