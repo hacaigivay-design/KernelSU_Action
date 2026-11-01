@@ -103,6 +103,32 @@ make_args() {
 	fi
 }
 
+# Print a compact, actionable error context when a build fails.
+# Called from the failure branch; never exits by itself.
+_dump_first_error() {
+	local log=$1
+	echo "================================================================"
+	echo "===== BUILD FAILED -- FIRST ERROR CONTEXT ====="
+	echo "================================================================"
+	if [ ! -f "$log" ]; then
+		echo "(no log file at ${log})"
+		return 0
+	fi
+	local first
+	first=$(grep -n -m1 -E "(^|[^a-zA-Z])error:|undefined reference|fatal error:" "$log" | cut -d: -f1 || true)
+	if [ -z "${first:-}" ]; then
+		echo "(no 'error:' line found -- dumping last 120 lines)"
+		tail -n 120 "$log"
+		return 0
+	fi
+	local start end
+	start=$(( first > 30 ? first - 30 : 1 ))
+	end=$(( first + 15 ))
+	echo ">>> first error at line ${first}; showing ${start}..${end}"
+	sed -n "${start},${end}p" "$log"
+	echo "================================================================"
+}
+
 build_kernel() {
 	group "Building kernel"
 	export PATH="${CLANG_PATH:-}:${PATH}"
@@ -131,16 +157,38 @@ build_kernel() {
 		info "ccache enabled (dir: ${CCACHE_DIR})"
 	fi
 
+	# -------- parallel vs serial (debug) --------
+	# DEBUG_BUILD=1 -> -j1 V=1 so the real "error:" line is not interleaved
+	# with other jobs. Everything is tee'd to build.log so it survives the
+	# Actions log truncation.
+	local jobs vflag log
+	jobs="$(nproc --all)"
+	vflag=""
+	log="${WORKSPACE}/build.log"
+	if [ "${DEBUG_BUILD:-0}" = "1" ]; then
+		jobs="1"
+		vflag="V=1"
+		info "DEBUG_BUILD=1: serial build (-j1 V=1), log -> ${log}"
+	else
+		info "parallel build (-j${jobs}), log -> ${log}"
+	fi
+
 	cd "$KERNEL_DIR"
 	info "make ${args} ${KERNEL_CONFIG}"
+
+	# defconfig generation (short, keep it simple)
 	# shellcheck disable=SC2086
-	make -j"$(nproc --all)" CC=clang $args "${KERNEL_CONFIG}" \
-		|| die "defconfig generation failed"
+	if ! make -j"${jobs}" ${vflag} CC=clang $args "${KERNEL_CONFIG}" 2>&1 | tee "$log"; then
+		_dump_first_error "$log"
+		die "defconfig generation failed"
+	fi
 
 	info "make ${args}"
 	# shellcheck disable=SC2086
-	make -j"$(nproc --all)" CC="$cc" $args \
-		|| die "kernel build failed"
+	if ! make -j"${jobs}" ${vflag} CC="$cc" $args 2>&1 | tee -a "$log"; then
+		_dump_first_error "$log"
+		die "kernel build failed"
+	fi
 
 	endgroup
 }
