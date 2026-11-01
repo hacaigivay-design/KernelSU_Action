@@ -38,17 +38,13 @@ prepare_defconfig() {
 		fi
 
 		if is_true "${ENABLE_KPM:-false}"; then
-			# patch_linux resolves symbols at runtime, so kallsyms must be complete.
 			kconf_set_many "$DEFCONFIG_PATH" \
 				CONFIG_KPM=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y
 		fi
 	fi
 
-	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
 
-	# Kept as a standalone switch for kernels that need kprobes for their own
-	# reasons, independent of the hook mode.
 	if is_true "${ADD_KPROBES_CONFIG:-false}"; then
 		kconf_set_many "$DEFCONFIG_PATH" \
 			CONFIG_MODULES=y CONFIG_KPROBES=y CONFIG_HAVE_KPROBES=y CONFIG_KPROBE_EVENTS=y
@@ -62,10 +58,8 @@ prepare_defconfig() {
 
 	is_true "${DISABLE_CC_WERROR:-false}" && kconf_disable "$DEFCONFIG_PATH" CONFIG_CC_WERROR
 
-	# Free-form extras: one CONFIG_x=y per line, or space separated.
 	if [ -n "${EXTRA_DEFCONFIG:-}" ]; then
 		local kv
-		# shellcheck disable=SC2086
 		for kv in $(printf '%s' "$EXTRA_DEFCONFIG" | tr '\n' ' '); do
 			[ -n "$kv" ] || continue
 			case "$kv" in
@@ -75,8 +69,6 @@ prepare_defconfig() {
 		done
 	fi
 
-	# A stable LOCALVERSION keeps artifact names predictable. Without this the
-	# tree appends "-dirty" as soon as any patch above touches a tracked file.
 	if [ -n "${KERNEL_NAME:-}" ]; then
 		kconf_set "$DEFCONFIG_PATH" CONFIG_LOCALVERSION "\"-${KERNEL_NAME}\""
 		if [ -f "${KERNEL_DIR}/scripts/setlocalversion" ]; then
@@ -92,16 +84,7 @@ prepare_defconfig() {
 # ----------------------------------------------------------------- build ---
 
 # Strip any KCFLAGS=... token from a free-form string.
-#
-# Why: EXTRA_CMDS / CUSTOM_CMDS are passed through `make $args` (word-split).
-# If they contain `KCFLAGS=...`, make treats it as a make variable and injects
-# its value *mid-command-line* for every compile. Old MediaTek trees emit
-#   -DKBUILD_BASENAME=$(KBUILD_BASENAME)
-# without quoting, so the injected KCFLAGS value lands right after the
-# `-DKBUILD_BASENAME` token and clang sees:
-#   -DKBUILD_BASENAME <value> <basename>
-# which fails with "macro name must be an identifier".  KCFLAGS must not be
-# propagated this way.
+# This was the original cause of "-DKBUILD_BASENAME flashlight_core" errors.
 _strip_kcflags() {
 	printf '%s' "$1" | sed -E 's/(^|[[:space:]])[^[:space:]]*KCFLAGS=[^[:space:]]*//g' \
 		| sed -E 's/^[[:space:]]+|[[:space:]]+$//g'
@@ -110,25 +93,23 @@ _strip_kcflags() {
 make_args() {
 	printf '%s' "O=out ARCH=${ARCH}"
 	if [ -n "${CUSTOM_CMDS:-}" ]; then
-		local cc_clean
-		cc_clean=$(_strip_kcflags "$CUSTOM_CMDS")
-		[ -n "$cc_clean" ] && printf ' %s' "$cc_clean"
+		local c
+		c=$(_strip_kcflags "$CUSTOM_CMDS")
+		[ -n "$c" ] && printf ' %s' "$c"
 	fi
 	if [ -n "${EXTRA_CMDS:-}" ]; then
-		local ec_clean
-		ec_clean=$(_strip_kcflags "$EXTRA_CMDS")
-		[ -n "$ec_clean" ] && printf ' %s' "$ec_clean"
+		local e
+		e=$(_strip_kcflags "$EXTRA_CMDS")
+		[ -n "$e" ] && printf ' %s' "$e"
 	fi
-	[ -n "${GCC_64:-}"      ] && printf ' %s' "$GCC_64"
-	[ -n "${GCC_32:-}"      ] && printf ' %s' "$GCC_32"
+	[ -n "${GCC_64:-}" ] && printf ' %s' "$GCC_64"
+	[ -n "${GCC_32:-}" ] && printf ' %s' "$GCC_32"
 	if is_true "${USE_LLVM:-false}"; then
 		printf ' LLVM=1 LLVM_IAS=1'
 		[ -n "${GCC_64:-}" ] || printf ' CROSS_COMPILE=aarch64-linux-gnu-'
 	fi
 }
 
-# Print a compact, actionable error context when a build fails.
-# Called from the failure branch; never exits by itself.
 _dump_first_error() {
 	local log=$1
 	echo "================================================================"
@@ -153,30 +134,48 @@ _dump_first_error() {
 	echo "================================================================"
 }
 
+# Patch scripts/Makefile.build + root Makefile so -DKBUILD_BASENAME is quoted.
+# This is the REAL fix for "macro name must be an identifier".
+# Idempotent: safe to run multiple times.
+_patch_kbuild_basename() {
+	local dir=$1
+	local changed=0
+	for f in "${dir}/scripts/Makefile.build" "${dir}/Makefile"; do
+		[ -f "$f" ] || continue
+		if grep -q -- '-DKBUILD_BASENAME=\$(KBUILD_BASENAME)' "$f" 2>/dev/null; then
+			# Replace unquoted form with quoted form
+			sed -i -E "s|-DKBUILD_BASENAME=\\\$\(KBUILD_BASENAME\)|-DKBUILD_BASENAME='\"\$(KBUILD_BASENAME)\"'|g" "$f"
+			changed=1
+			info "patched KBUILD_BASENAME quoting in $f"
+		fi
+	done
+	if [ "$changed" = "1" ]; then
+		ok "KBUILD_BASENAME quoting patched"
+	else
+		info "KBUILD_BASENAME already quoted (or pattern not found)"
+	fi
+}
+
 build_kernel() {
 	group "Building kernel"
 	export PATH="${CLANG_PATH:-}:${PATH}"
 	export KBUILD_BUILD_HOST=${KBUILD_BUILD_HOST:-Github-Action}
 	export KBUILD_BUILD_USER=${KBUILD_BUILD_USER:-kernelsu-action}
 
-	# DISABLE_LTO is this action's boolean configuration switch, but several
-	# Android kernel trees use the same Make variable for compiler flags (for
-	# example, "-fno-lto").  Leaving our value in the environment makes a
-	# non-LTO build invoke `clang ... false ...`, treating "false" as an input
-	# file.  prepare_defconfig() has already consumed the action setting, so let
-	# Kbuild own the name from this point on.
 	unset DISABLE_LTO
-
-	# KCFLAGS in the environment is even worse than via EXTRA_CMDS: make picks
-	# it up as a command-line variable and injects it into every compile.  Drop
-	# it here; the action never needs to set it.
 	unset KCFLAGS || true
 
-	# Custom manager signature, when the user builds their own manager APK.
 	if [ -n "${KSU_EXPECTED_SIZE:-}" ] && [ -n "${KSU_EXPECTED_HASH:-}" ]; then
 		export KSU_EXPECTED_SIZE KSU_EXPECTED_HASH
 		info "using custom manager signature (size=${KSU_EXPECTED_SIZE})"
 	fi
+
+	# ---------- FIX ROOT CAUSE: quote -DKBUILD_BASENAME in kernel ----------
+	# Old MTK trees emit `-DKBUILD_BASENAME=$(KBUILD_BASENAME)` unquoted, which
+	# clang rejects as "macro name must be an identifier" when KBUILD_BASENAME
+	# is `flashlight_core`. This is independent of any env var; patching the
+	# kernel Makefile is the only reliable fix.
+	_patch_kbuild_basename "$KERNEL_DIR"
 
 	local cc="clang" args
 	args=$(make_args)
@@ -186,10 +185,6 @@ build_kernel() {
 		info "ccache enabled (dir: ${CCACHE_DIR})"
 	fi
 
-	# -------- parallel vs serial (debug) --------
-	# DEBUG_BUILD=1 -> -j1 V=1 so the real "error:" line is not interleaved
-	# with other jobs. Everything is tee'd to build.log so it survives the
-	# Actions log truncation.
 	local jobs vflag log
 	jobs="$(nproc --all)"
 	vflag=""
@@ -203,9 +198,15 @@ build_kernel() {
 	fi
 
 	cd "$KERNEL_DIR"
-	info "make ${args} ${KERNEL_CONFIG}"
 
-	# defconfig generation (short, keep it simple)
+	info "=== make args dump ==="
+	info "args: ${args}"
+	info "CC: ${cc}"
+	info "KCFLAGS: ${KCFLAGS:-<unset>}"
+	info "GCC_64: ${GCC_64:-<unset>}"
+	info "GCC_32: ${GCC_32:-<unset>}"
+
+	info "make ${args} ${KERNEL_CONFIG}"
 	# shellcheck disable=SC2086
 	if ! make -j"${jobs}" ${vflag} CC=clang $args KCFLAGS= "${KERNEL_CONFIG}" 2>&1 | tee "$log"; then
 		_dump_first_error "$log"
@@ -242,13 +243,10 @@ check_output() {
 		ok "dtbo.img present"
 	fi
 
-	# KPM rewrites the image in place, so it has to happen after the build and
-	# before packaging.
 	if is_true "${ENABLE_KPM:-false}"; then
 		kpm_patch_image "$image"
 	fi
 
-	# Record the version string the kernel actually reports.
 	if [ -f "${OUT}/include/generated/utsrelease.h" ]; then
 		local rel
 		rel=$(sed -nE 's/.*UTS_RELEASE[[:space:]]+"([^"]+)".*/\1/p' "${OUT}/include/generated/utsrelease.h")
