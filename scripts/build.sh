@@ -91,10 +91,34 @@ prepare_defconfig() {
 
 # ----------------------------------------------------------------- build ---
 
+# Strip any KCFLAGS=... token from a free-form string.
+#
+# Why: EXTRA_CMDS / CUSTOM_CMDS are passed through `make $args` (word-split).
+# If they contain `KCFLAGS=...`, make treats it as a make variable and injects
+# its value *mid-command-line* for every compile. Old MediaTek trees emit
+#   -DKBUILD_BASENAME=$(KBUILD_BASENAME)
+# without quoting, so the injected KCFLAGS value lands right after the
+# `-DKBUILD_BASENAME` token and clang sees:
+#   -DKBUILD_BASENAME <value> <basename>
+# which fails with "macro name must be an identifier".  KCFLAGS must not be
+# propagated this way.
+_strip_kcflags() {
+	printf '%s' "$1" | sed -E 's/(^|[[:space:]])[^[:space:]]*KCFLAGS=[^[:space:]]*//g' \
+		| sed -E 's/^[[:space:]]+|[[:space:]]+$//g'
+}
+
 make_args() {
 	printf '%s' "O=out ARCH=${ARCH}"
-	[ -n "${CUSTOM_CMDS:-}" ] && printf ' %s' "$CUSTOM_CMDS"
-	[ -n "${EXTRA_CMDS:-}"  ] && printf ' %s' "$EXTRA_CMDS"
+	if [ -n "${CUSTOM_CMDS:-}" ]; then
+		local cc_clean
+		cc_clean=$(_strip_kcflags "$CUSTOM_CMDS")
+		[ -n "$cc_clean" ] && printf ' %s' "$cc_clean"
+	fi
+	if [ -n "${EXTRA_CMDS:-}" ]; then
+		local ec_clean
+		ec_clean=$(_strip_kcflags "$EXTRA_CMDS")
+		[ -n "$ec_clean" ] && printf ' %s' "$ec_clean"
+	fi
 	[ -n "${GCC_64:-}"      ] && printf ' %s' "$GCC_64"
 	[ -n "${GCC_32:-}"      ] && printf ' %s' "$GCC_32"
 	if is_true "${USE_LLVM:-false}"; then
@@ -143,6 +167,11 @@ build_kernel() {
 	# Kbuild own the name from this point on.
 	unset DISABLE_LTO
 
+	# KCFLAGS in the environment is even worse than via EXTRA_CMDS: make picks
+	# it up as a command-line variable and injects it into every compile.  Drop
+	# it here; the action never needs to set it.
+	unset KCFLAGS || true
+
 	# Custom manager signature, when the user builds their own manager APK.
 	if [ -n "${KSU_EXPECTED_SIZE:-}" ] && [ -n "${KSU_EXPECTED_HASH:-}" ]; then
 		export KSU_EXPECTED_SIZE KSU_EXPECTED_HASH
@@ -178,14 +207,14 @@ build_kernel() {
 
 	# defconfig generation (short, keep it simple)
 	# shellcheck disable=SC2086
-	if ! make -j"${jobs}" ${vflag} CC=clang $args "${KERNEL_CONFIG}" 2>&1 | tee "$log"; then
+	if ! make -j"${jobs}" ${vflag} CC=clang $args KCFLAGS= "${KERNEL_CONFIG}" 2>&1 | tee "$log"; then
 		_dump_first_error "$log"
 		die "defconfig generation failed"
 	fi
 
 	info "make ${args}"
 	# shellcheck disable=SC2086
-	if ! make -j"${jobs}" ${vflag} CC="$cc" $args 2>&1 | tee -a "$log"; then
+	if ! make -j"${jobs}" ${vflag} CC="$cc" $args KCFLAGS= 2>&1 | tee -a "$log"; then
 		_dump_first_error "$log"
 		die "kernel build failed"
 	fi
