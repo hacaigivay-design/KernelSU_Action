@@ -12,8 +12,14 @@ GCC64_DIR="${WORKSPACE}/gcc-64"
 GCC32_DIR="${WORKSPACE}/gcc-32"
 
 AOSP_CLANG_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+AOSP_GCC_BASE="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86"
 
-# Known-good AOSP clang branch/version pairs, verified 2026-07-27.
+# Minimum plausible size for a real AOSP clang tarball. A placeholder archive
+# is ~165 bytes; a real one is tens to hundreds of MB. Anything below this is
+# treated as an empty/placeholder download.
+CLANG_MIN_BYTES=$((5 * 1024 * 1024))
+
+# Known-good AOSP clang branch/version pairs, verified 2026-11-01.
 #
 # This table exists because the AOSP prebuilt repo is a minefield: every
 # kernel-build branch lists *every* clang version directory in its tree, but
@@ -29,10 +35,15 @@ AOSP_CLANG_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/
 #   main-kernel-2025          r547379     <- default
 #   main-kernel-2025          r536225
 #   main-kernel-build-2024    r510928
-#   master-kernel-build-2022  r450784e    last of the master-* era
+#   master-kernel-build-2022  r450784e    last of the master-* era (may be archived)
 #
 # Note the branch naming changed twice: master-kernel-build-YYYY became
 # main-kernel-build-YYYY in 2023, then main-kernel-YYYY from 2025 on.
+#
+# NOTE: this table is a hint, not a guarantee. AOSP can depopulate an old
+# branch at any time. The download is validated against CLANG_MIN_BYTES and
+# `gzip -t` regardless, so a stale entry here produces a clear error instead
+# of a cryptic tar failure.
 clang_known_good() {
 	case "$1/$2" in
 		main-kernel/r596125 | \
@@ -48,6 +59,49 @@ clang_known_good() {
 	esac
 }
 
+# Validate that a file exists, is non-trivial, and is a real gzip archive.
+# Dies with an actionable message otherwise. Used for every AOSP tarball.
+validate_gzip_archive() {
+	local file=$1 label=$2
+	[ -f "$file" ] || die "${label}: download missing at ${file}"
+
+	local size
+	size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+	if [ "$size" -lt "$CLANG_MIN_BYTES" ]; then
+		warn "${label}: downloaded archive is only ${size} bytes."
+		warn "This is almost certainly an empty placeholder archive --"
+		warn "the branch/version pair has no real toolchain in it."
+		if [ "$size" -gt 0 ] && [ "$size" -lt 4096 ]; then
+			warn "First bytes:"
+			head -c 200 "$file" | od -An -c | head -3 >&2 || true
+		fi
+		die "${label}: refusing to extract empty/placeholder archive.
+       Pick a populated branch/version pair (see scripts/toolchain.sh)."
+	fi
+
+	if ! gzip -t "$file" 2>/dev/null; then
+		warn "${label}: file is not a valid gzip archive (size ${size} bytes)."
+		warn "First bytes:"
+		head -c 200 "$file" | od -An -c | head -3 >&2 || true
+		die "${label}: archive is corrupt or is an HTML/404 page."
+	fi
+}
+
+# Extract a filename extension useful for routing to extract_archive.
+# Handles multi-dot names (e.g. clang-18.0.0.tar.gz -> tar.gz).
+archive_ext() {
+	local name=${1##*/}
+	case "$name" in
+		*.tar.gz)  echo "tar.gz" ;;
+		*.tgz)     echo "tgz" ;;
+		*.tar.xz)  echo "tar.xz" ;;
+		*.tar.zst) echo "tar.zst" ;;
+		*.tar.bz2) echo "tar.bz2" ;;
+		*.zip)     echo "zip" ;;
+		*)         echo "${name##*.}" ;;
+	esac
+}
+
 setup_clang() {
 	rm -rf "$CLANG_DIR"; mkdir -p "$CLANG_DIR"
 
@@ -56,10 +110,13 @@ setup_clang() {
 		local src=${CUSTOM_CLANG_SOURCE:?CUSTOM_CLANG_SOURCE required}
 		case "$src" in
 			*.tar.gz | *.tgz | *.tar.xz | *.tar.zst | *.tar.bz2)
-				fetch "$src" "${WORKSPACE}/clang-archive"
-				# Name the temp file by extension so extract_archive can route it.
-				local ext="${src##*/}"; ext="${ext#*.}"
-				mv "${WORKSPACE}/clang-archive" "${WORKSPACE}/clang.${ext}"
+				local ext
+				ext=$(archive_ext "$src")
+				fetch "$src" "${WORKSPACE}/clang.${ext}"
+				# tar.bz2/tar.xz/tar.zst are not gzip; only validate gzip ones.
+				case "$ext" in
+					tar.gz | tgz) validate_gzip_archive "${WORKSPACE}/clang.${ext}" "custom clang" ;;
+				esac
 				extract_archive "${WORKSPACE}/clang.${ext}" "$CLANG_DIR" ;;
 			*.zip)
 				fetch "$src" "${WORKSPACE}/clang.zip"
@@ -75,27 +132,35 @@ setup_clang() {
 		group "Downloading AOSP Clang"
 		local branch=${CLANG_BRANCH:-main-kernel-2025}
 		local version=${CLANG_VERSION:-r547379}
+		local url="${AOSP_CLANG_BASE}/+archive/refs/heads/${branch}/clang-${version}.tar.gz"
 
 		if ! clang_known_good "$branch" "$version"; then
 			warn "clang ${version} on branch ${branch} is not in the verified-good table."
 			warn "AOSP lists many version directories per branch but only populates a few;"
 			warn "an unpopulated one downloads as a valid but EMPTY archive."
 			warn "Verified pairs: main-kernel/r596125, main-kernel-2026/r584948c,"
-			warn "main-kernel-2025/r547379, main-kernel-build-2024/r510928,"
-			warn "master-kernel-build-2022/r450784e"
+			warn "main-kernel-2025/r547379, main-kernel-2025/r536225,"
+			warn "main-kernel-build-2024/r510928, master-kernel-build-2022/r450784e"
 		fi
 
-		fetch "${AOSP_CLANG_BASE}/+archive/refs/heads/${branch}/clang-${version}.tar.gz" \
-			"${WORKSPACE}/clang.tar.gz"
+		echo "  [*] fetching ${url}"
+		fetch "$url" "${WORKSPACE}/clang.tar.gz"
+
+		# Turn the empty-archive trap into an actionable error before tar dies.
+		validate_gzip_archive "${WORKSPACE}/clang.tar.gz" "AOSP clang ${branch}/${version}"
+
 		extract_archive "${WORKSPACE}/clang.tar.gz" "$CLANG_DIR"
 	fi
 
-	# The check that turns the empty-archive trap into an actionable error.
-	[ -x "${CLANG_DIR}/bin/clang" ] \
-		|| die "no usable clang at ${CLANG_DIR}/bin/clang.
-       The archive extracted to: $(ls -A "$CLANG_DIR" 2>/dev/null | head -5 | tr '\n' ' ')
+	# The check that turns an extracted-but-empty directory into a clear error.
+	if [ ! -x "${CLANG_DIR}/bin/clang" ]; then
+		local contents
+		contents=$(ls -A "$CLANG_DIR" 2>/dev/null | head -5 | tr '\n' ' ')
+		die "no usable clang at ${CLANG_DIR}/bin/clang.
+       The archive extracted to: ${contents:-<empty>}
        If this was an AOSP download, that branch/version pair is a placeholder
        with no toolchain in it. Pick a verified pair (see scripts/toolchain.sh)."
+	fi
 
 	local ver
 	ver=$("${CLANG_DIR}/bin/clang" --version | head -n1)
@@ -112,14 +177,16 @@ setup_gcc() {
 
 	if is_true "${USE_CUSTOM_GCC_64:-false}"; then
 		group "Downloading custom GCC (arm64)"
-		fetch_toolchain_generic "${CUSTOM_GCC_64_SOURCE}" "${CUSTOM_GCC_64_BRANCH:-}" "$GCC64_DIR"
+		fetch_toolchain_generic "${CUSTOM_GCC_64_SOURCE:-}" "${CUSTOM_GCC_64_BRANCH:-}" "$GCC64_DIR"
 		export_env GCC_64 "CROSS_COMPILE=${GCC64_DIR}/bin/${CUSTOM_GCC_64_BIN:-aarch64-linux-android-}"
 		endgroup
 	elif is_true "${ENABLE_GCC_ARM64:-false}"; then
 		group "Downloading AOSP GCC (arm64)"
 		mkdir -p "$GCC64_DIR"
-		fetch "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${gcc_tag}.tar.gz" \
-			"${WORKSPACE}/gcc-aarch64.tar.gz"
+		local url="${AOSP_GCC_BASE}/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${gcc_tag}.tar.gz"
+		echo "  [*] fetching ${url}"
+		fetch "$url" "${WORKSPACE}/gcc-aarch64.tar.gz"
+		validate_gzip_archive "${WORKSPACE}/gcc-aarch64.tar.gz" "AOSP GCC arm64 ${gcc_tag}"
 		extract_archive "${WORKSPACE}/gcc-aarch64.tar.gz" "$GCC64_DIR"
 		export_env GCC_64 "CROSS_COMPILE=${GCC64_DIR}/bin/aarch64-linux-android-"
 		endgroup
@@ -127,14 +194,16 @@ setup_gcc() {
 
 	if is_true "${USE_CUSTOM_GCC_32:-false}"; then
 		group "Downloading custom GCC (arm32)"
-		fetch_toolchain_generic "${CUSTOM_GCC_32_SOURCE}" "${CUSTOM_GCC_32_BRANCH:-}" "$GCC32_DIR"
+		fetch_toolchain_generic "${CUSTOM_GCC_32_SOURCE:-}" "${CUSTOM_GCC_32_BRANCH:-}" "$GCC32_DIR"
 		export_env GCC_32 "CROSS_COMPILE_ARM32=${GCC32_DIR}/bin/${CUSTOM_GCC_32_BIN:-arm-linux-androideabi-}"
 		endgroup
 	elif is_true "${ENABLE_GCC_ARM32:-false}"; then
 		group "Downloading AOSP GCC (arm32)"
 		mkdir -p "$GCC32_DIR"
-		fetch "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/${gcc_tag}.tar.gz" \
-			"${WORKSPACE}/gcc-arm.tar.gz"
+		local url="${AOSP_GCC_BASE}/arm/arm-linux-androideabi-4.9/+archive/refs/tags/${gcc_tag}.tar.gz"
+		echo "  [*] fetching ${url}"
+		fetch "$url" "${WORKSPACE}/gcc-arm.tar.gz"
+		validate_gzip_archive "${WORKSPACE}/gcc-arm.tar.gz" "AOSP GCC arm32 ${gcc_tag}"
 		extract_archive "${WORKSPACE}/gcc-arm.tar.gz" "$GCC32_DIR"
 		export_env GCC_32 "CROSS_COMPILE_ARM32=${GCC32_DIR}/bin/arm-linux-androideabi-"
 		endgroup
@@ -142,12 +211,17 @@ setup_gcc() {
 }
 
 fetch_toolchain_generic() {
-	local src=$1 branch=$2 dest=$3
+	local src=${1:-} branch=${2:-} dest=$3
+	[ -n "$src" ] || die "fetch_toolchain_generic: empty source URL"
 	rm -rf "$dest"; mkdir -p "$dest"
 	case "$src" in
-		*.tar.gz | *.tgz | *.tar.xz | *.tar.zst)
-			local ext="${src##*/}"; ext="${ext#*.}"
+		*.tar.gz | *.tgz | *.tar.xz | *.tar.zst | *.tar.bz2)
+			local ext
+			ext=$(archive_ext "$src")
 			fetch "$src" "${WORKSPACE}/tc.${ext}"
+			case "$ext" in
+				tar.gz | tgz) validate_gzip_archive "${WORKSPACE}/tc.${ext}" "custom toolchain" ;;
+			esac
 			extract_archive "${WORKSPACE}/tc.${ext}" "$dest" ;;
 		*.zip)
 			fetch "$src" "${WORKSPACE}/tc.zip"
